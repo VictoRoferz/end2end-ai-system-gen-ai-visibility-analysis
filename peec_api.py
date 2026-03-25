@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Any, Callable, Optional
 
 import requests
@@ -26,10 +27,16 @@ class PeecClient:
         self.session.headers["x-api-key"] = api_key
 
     def _request(self, method: str, path: str, params: Optional[dict] = None, json: Optional[dict] = None) -> Any:
-        resp = self.session.request(method, f"{self.base_url}{path}", params=params, json=json)
-        if not resp.ok:
-            raise PeecAPIError(resp.status_code, resp.text)
-        return resp.json()
+        for attempt in range(5):
+            resp = self.session.request(method, f"{self.base_url}{path}", params=params, json=json)
+            if resp.status_code == 429:
+                wait = 2 ** attempt
+                time.sleep(wait)
+                continue
+            if not resp.ok:
+                raise PeecAPIError(resp.status_code, resp.text)
+            return resp.json()
+        raise PeecAPIError(429, "Rate limit exceeded after 5 retries")
 
     def _get(self, path: str, **params) -> Any:
         filtered = {k: v for k, v in params.items() if v is not None}
