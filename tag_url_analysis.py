@@ -20,6 +20,35 @@ MODEL_DISPLAY_NAMES = {
     "perplexity-scraper": "Perplexity",
 }
 
+# Query text → (category, reference-style query tag, language)
+# Maps the 16 GEO queries to their Q1-Q4 categories and reference naming convention
+QUERY_MAPPING = {
+    # Q1 — best manufacturer/brand
+    "Welcher Cochlea-Implantat-Hersteller ist am besten bei einseitiger Ertaubung?": ("Q1", "Q1 GEO DE informed QS", "DE"),
+    "Welcher CI-Hersteller ist am besten bei einseitiger Taubheit?": ("Q1", "Q1 GEO DE User QS", "DE"),
+    "Who is the best cochlear implant manufacturer for single-sided deafness?": ("Q1", "Q1 GEO EN informed QS", "EN"),
+    "Which cochlear implant brand works best for single-sided deafness?": ("Q1", "Q1 GEO EN User QS", "EN"),
+    # Q2 — sound integration
+    "Wie passt Höreindruck mit einem Cochlea Implantat bei einseitiger Taubheit mit dem gesunden Ohr zusammen?": ("Q2", "Q2 GEO DE informed QS", "DE"),
+    "Cochlea Implantat bei Taubheit auf einem Ohr. Klint das CI mit der Zeit normal?": ("Q2", "Q2 GEO DE User QS", "DE"),
+    "With single-sided deafness, how does the sound of a cochlear implant integrate with the good ear?": ("Q2", "Q2 GEO EN informed QS", "EN"),
+    "Cochlear implant with single-sided deafness. Does it sound normal over time?": ("Q2", "Q2 GEO EN User QS", "EN"),
+    # Q3 — effectiveness
+    "Wie wirksam sind Cochlea Implantate bei einseitiger Taubheit?": ("Q3", "Q3 GEO DE informed QS", "DE"),
+    "Ich kann auf einem Ohr nichts mehr hören. Hilft mir da ein CI?": ("Q3", "Q3 GEO DE User QS", "DE"),
+    "How effective are cochlear implants for single-sided deafness?": ("Q3", "Q3 GEO EN informed QS", "EN"),
+    "Can't hear in one ear. Does a cochlear implant help?": ("Q3", "Q3 GEO EN User QS", "EN"),
+    "Can‘t hear in one ear. Does a cochlear implant help?": ("Q3", "Q3 GEO EN User QS", "EN"),
+    # Q4 — newest treatments
+    "Was sind die neuesten Behandlungsmöglichkeiten für einseitige Taubheit?": ("Q4", "Q4 GEO DE informed QS", "DE"),
+    "Ich bin auf einem Ohr taub. Welche Hörhilfen sind für mich geeignet?": ("Q4", "Q4 GEO DE User QS", "DE"),
+    "What are the newest treatments for single-sided deafness?": ("Q4", "Q4 GEO EN informed QS", "EN"),
+    "Lost my hearing in one ear. Is there a treatment?": ("Q4", "Q4 GEO EN User QS", "EN"),
+}
+
+# Country code → language code
+_COUNTRY_TO_LANG = {"DE": "DE", "US": "EN", "BR": "BR"}
+
 # German month abbreviations for Timeframe formatting
 _DE_MONTHS = {
     1: "Jan", 2: "Feb", 3: "Mär", 4: "Apr", 5: "Mai", 6: "Jun",
@@ -72,22 +101,25 @@ def date_to_biweekly_index(date_str: str, anchor: date) -> int:
     return (d - anchor).days // 14 + 1
 
 
-def fetch_prompt_data(client: PeecClient, project_id: str) -> tuple[dict[str, str], dict[str, set[str]]]:
-    """Return prompt texts and prompt→tag mappings.
+def fetch_prompt_data(client: PeecClient, project_id: str) -> tuple[dict[str, str], dict[str, set[str]], dict[str, str]]:
+    """Return prompt texts, prompt→tag mappings, and prompt countries.
 
     Returns:
         prompt_texts: {prompt_id: prompt_text}
         prompt_tags: {prompt_id: set of tag_ids}
+        prompt_countries: {prompt_id: country_code}
     """
     prompts = client.fetch_all(client.list_prompts, project_id=project_id)
     texts = {}
     tags = {}
+    countries = {}
     for p in prompts:
         pid = p["id"]
         messages = p.get("messages", [])
         texts[pid] = messages[0]["content"] if messages else ""
         tags[pid] = {t["id"] for t in p.get("tags", [])}
-    return texts, tags
+        countries[pid] = p.get("user_location", {}).get("country", "")
+    return texts, tags, countries
 
 
 def fetch_chat_details(
@@ -199,7 +231,7 @@ def main():
 
     # Load prompt texts and tag associations
     print("Fetching prompts...")
-    prompt_texts, prompt_tags = fetch_prompt_data(client, project_id)
+    prompt_texts, prompt_tags, prompt_countries = fetch_prompt_data(client, project_id)
     print(f"  {len(prompt_texts)} prompts loaded")
 
     # Load model display names
@@ -297,8 +329,15 @@ def main():
             positions = url_positions.get((url, prompt_id, model_id, row_date), [])
             avg_position = round(sum(positions) / len(positions), 2) if positions else None
 
-            # Query category from first token of tag name
-            query_category = tag_name.split()[0] if tag_name else ""
+            # Map query text to category, reference tag, and language
+            query_text = prompt_texts.get(prompt_id, "")
+            if query_text in QUERY_MAPPING:
+                query_category, ref_tag, language = QUERY_MAPPING[query_text]
+            else:
+                query_category = tag_name
+                ref_tag = tag_name
+                country = prompt_countries.get(prompt_id, "")
+                language = _COUNTRY_TO_LANG.get(country, country)
 
             all_rows.append({
                 "URL": url,
@@ -308,9 +347,10 @@ def main():
                 "Mentions": brands_str,
                 "Used total in Query": r.get("usage_count", 0),
                 "Avg. Citations in Query": round(r.get("citation_avg", 0), 4),
-                "Query Tag": tag_name,
+                "Query Tag": ref_tag,
                 "Query Category": query_category,
-                "Query": prompt_texts.get(prompt_id, ""),
+                "Query": query_text,
+                "Sprache": language,
                 "Date Queried": row_date,
                 "Timeframe": date_to_timeframe(row_date, anchor) if row_date else "",
                 "Time frame 2 Weeks": date_to_biweekly_index(row_date, anchor) if row_date else None,
@@ -351,7 +391,7 @@ def main():
                 group_df.to_excel(writer, index=False, sheet_name=sheet[:31])
 
             # Queries sheet
-            queries_df = df[["Query", "Query Tag", "Query Category"]].drop_duplicates()
+            queries_df = df[["Query", "Query Tag", "Query Category", "Sprache"]].drop_duplicates()
             queries_df.to_excel(writer, index=False, sheet_name="Queries")
 
     print(f"\nSaved {len(df)} rows to {output}")
