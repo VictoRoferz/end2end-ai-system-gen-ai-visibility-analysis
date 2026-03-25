@@ -27,16 +27,19 @@ class PeecClient:
         self.session.headers["x-api-key"] = api_key
 
     def _request(self, method: str, path: str, params: Optional[dict] = None, json: Optional[dict] = None) -> Any:
-        for attempt in range(5):
+        max_retries = 20
+        for attempt in range(max_retries):
             resp = self.session.request(method, f"{self.base_url}{path}", params=params, json=json)
             if resp.status_code == 429:
-                wait = 2 ** attempt
+                # Use Retry-After header if present, otherwise exponential backoff
+                wait = int(resp.headers.get("Retry-After", min(2 ** attempt, 60)))
+                print(f"        rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})...", end="\r", flush=True)
                 time.sleep(wait)
                 continue
             if not resp.ok:
                 raise PeecAPIError(resp.status_code, resp.text)
             return resp.json()
-        raise PeecAPIError(429, "Rate limit exceeded after 5 retries")
+        raise PeecAPIError(429, f"Rate limit exceeded after {max_retries} retries")
 
     def _get(self, path: str, **params) -> Any:
         filtered = {k: v for k, v in params.items() if v is not None}
