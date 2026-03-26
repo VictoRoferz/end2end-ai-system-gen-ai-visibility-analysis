@@ -122,18 +122,63 @@ def fetch_prompt_data(client: PeecClient, project_id: str) -> tuple[dict[str, st
     return texts, tags, countries
 
 
-def fetch_chat_details(
+def prefetch_all_chats(
     client: PeecClient,
     project_id: str,
+    all_chats: list[dict],
+) -> dict[str, dict]:
+    """Fetch content for ALL chats in one upfront pass.
+
+    Instead of fetching per-tag (which re-fetches overlapping chats and requires
+    a large throttle), this does a single sequential pass over every unique chat
+    with 0.5s throttle. The 20-retry mechanism in _request() handles any 429s.
+
+    Returns:
+        {chat_id: content_dict} for every successfully fetched chat.
+    """
+    unique_ids = list({c["id"] for c in all_chats})
+    cache: dict[str, dict] = {}
+    failed: list[str] = []
+
+    for i, chat_id in enumerate(unique_ids):
+        if (i + 1) % 50 == 0 or (i + 1) == len(unique_ids):
+            print(f"  Fetching chat {i + 1}/{len(unique_ids)}...", end="\r", flush=True)
+        try:
+            cache[chat_id] = client.get_chat_content(chat_id, project_id)
+        except Exception:
+            failed.append(chat_id)
+        time.sleep(0.5)
+
+    # Retry failed chats with longer pause
+    if failed:
+        print(f"\n  Retrying {len(failed)} failed chats after cooldown...")
+        time.sleep(10)
+        still_failed: list[str] = []
+        for i, chat_id in enumerate(failed):
+            print(f"  Retry {i + 1}/{len(failed)}...", end="\r", flush=True)
+            time.sleep(2.0)
+            try:
+                cache[chat_id] = client.get_chat_content(chat_id, project_id)
+            except Exception as e:
+                print(f"\n  permanently failed: chat {chat_id}: {e}", file=sys.stderr)
+                still_failed.append(chat_id)
+        if still_failed:
+            print(f"\n  WARNING: {len(still_failed)} chats could not be fetched (data may be incomplete)")
+
+    print(f"\n  {len(cache)}/{len(unique_ids)} chats fetched successfully")
+    return cache
+
+
+def build_chat_details(
     tag_id: str,
     prompt_tags: dict[str, set[str]],
     all_chats: list[dict],
     chat_cache: dict[str, dict],
 ) -> tuple[dict, dict, dict]:
-    """Fetch chat-level brand mentions, citation positions, and LLM responses.
+    """Build brand mentions, citation positions, and LLM responses from pre-fetched cache.
 
-    Uses all_chats (from list_chats) filtered by prompt→tag association to cover
-    all models (GPT, AI Overviews, Perplexity, etc.), not just GPT.
+    Pure dict-lookup — no API calls. All content was already fetched by
+    prefetch_all_chats().
 
     Returns:
         chat_brands: {(prompt_id, model_id, date): set of brand names}
@@ -160,28 +205,17 @@ def fetch_chat_details(
             seen.add(combo)
             chat_keys[cid].append((prompt_id, model_id, c_date))
 
-    # Fetch each chat's content (with cache + throttle)
+    # Process pre-fetched content (no API calls, no sleeps)
     chat_brands: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     url_positions: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
     chat_responses: dict[tuple[str, str, str], str] = {}
-    fetched = 0
+    skipped = 0
 
-    for i, (chat_id, associations) in enumerate(chat_keys.items()):
-        if (i + 1) % 25 == 0:
-            print(f"      chat {i + 1}/{len(chat_keys)}", end="\r", flush=True)
-
-        if chat_id in chat_cache:
-            content = chat_cache[chat_id]
-        else:
-            try:
-                content = client.get_chat_content(chat_id, project_id)
-                chat_cache[chat_id] = content
-                fetched += 1
-                if fetched % 10 == 0:
-                    time.sleep(0.5)
-            except Exception as e:
-                print(f"      warning: chat {chat_id} failed: {e}", file=sys.stderr)
-                continue
+    for chat_id, associations in chat_keys.items():
+        content = chat_cache.get(chat_id)
+        if content is None:
+            skipped += 1
+            continue
 
         # Extract assistant response
         assistant_text = ""
@@ -192,23 +226,16 @@ def fetch_chat_details(
 
         for prompt_id, model_id, q_date in associations:
             key = (prompt_id, model_id, q_date)
-
-            # Brand mentions
             for brand in content.get("brands_mentioned", []):
                 chat_brands[key].add(brand["name"])
-
-            # Citation positions per URL
             for src in content.get("sources", []):
                 url_key = (src["url"], prompt_id, model_id, q_date)
                 url_positions[url_key].append(src.get("citationPosition", 0))
-
-            # LLM response
             if key not in chat_responses:
                 chat_responses[key] = assistant_text
 
-    if chat_keys:
-        cached = len(chat_keys) - fetched
-        print(f"      {len(chat_keys)} chats ({fetched} fetched, {cached} cached)     ")
+    cached_count = len(chat_keys) - skipped
+    print(f"    {len(chat_keys)} chats ({cached_count} from cache, {skipped} missing)")
 
     return dict(chat_brands), dict(url_positions), chat_responses
 
@@ -219,6 +246,7 @@ def main():
     parser.add_argument("--end-date", default=date.today().isoformat(), help="End date (YYYY-MM-DD)")
     parser.add_argument("--output", default="tag_url_analysis.xlsx", help="Output file (.xlsx or .csv)")
     parser.add_argument("--tags", nargs="*", help="Filter to specific tag names (default: all)")
+    parser.add_argument("--exclude-tags", nargs="*", help="Exclude specific tag names")
     args = parser.parse_args()
 
     client = PeecClient()
@@ -252,6 +280,10 @@ def main():
         tag_filter = {t.lower() for t in args.tags}
         tags = [t for t in tags if t["name"].lower() in tag_filter]
 
+    if args.exclude_tags:
+        exclude_filter = {t.lower() for t in args.exclude_tags}
+        tags = [t for t in tags if t["name"].lower() not in exclude_filter]
+
     print(f"Processing {len(tags)} tags: {[t['name'] for t in tags]}\n")
 
     # Fetch all chats for the date range (covers all models)
@@ -262,9 +294,12 @@ def main():
     )
     print(f"  {len(all_chats)} chats loaded")
 
+    # Prefetch ALL chat content in one pass (main optimization)
+    print("Prefetching all chat content...")
+    chat_cache = prefetch_all_chats(client, project_id, all_chats)
+
     all_rows = []
     all_dates: list[str] = []
-    chat_cache: dict[str, dict] = {}
 
     # First pass: collect all URL rows and dates
     tag_data: list[tuple[str, str, list, dict, dict, dict]] = []
@@ -294,10 +329,10 @@ def main():
             if d:
                 all_dates.append(d)
 
-        # Layer 2: Chat details (brand mentions + citation positions + LLM output)
-        print("    Fetching chat details...")
-        chat_brands, url_positions, chat_responses = fetch_chat_details(
-            client, project_id, tag_id, prompt_tags, all_chats, chat_cache,
+        # Layer 2: Chat details from pre-fetched cache (no API calls)
+        print("    Building chat details...")
+        chat_brands, url_positions, chat_responses = build_chat_details(
+            tag_id, prompt_tags, all_chats, chat_cache,
         )
 
         tag_data.append((tag_name, tag_id, url_rows, chat_brands, url_positions, chat_responses))
