@@ -128,7 +128,8 @@ class PeecClient:
         offset = 0
         while True:
             page = method(limit=page_size, offset=offset, **kwargs)
-            if isinstance(page, list):
+            if isinstance(page,
+                           list):
                 items = page
             elif isinstance(page, dict) and "data" in page:
                 items = page["data"]
